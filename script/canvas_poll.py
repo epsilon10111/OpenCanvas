@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Canvas 轮询检查脚本
-定期检查通知、作业、新文件，有增量时生成通知文件
+定期检查通知、作业、新文件，有增量时通过微信发送通知
 
 用法:
     python script/canvas_poll.py [--dry-run]
@@ -9,12 +9,11 @@ Canvas 轮询检查脚本
 配置:
     - config/config.yaml 中的 canvas 配置
     - state/poll_state.json (自动创建，记录上次检查状态)
-    - state/poll_notification.md (生成的通知文件)
     
 特点:
-    - 仅增量通知 - 无新内容时不生成通知
+    - 仅增量通知 - 无新内容时不发送消息
     - 20MB 限制 - 超过 20MB 的文件只记录链接，不下载
-    - 本地通知 - 生成 Markdown 文件供查看
+    - 微信通知 - 直接发送消息到当前聊天
 """
 
 from __future__ import annotations
@@ -208,12 +207,31 @@ def format_markdown_digest(
     return "\n".join(lines)
 
 
-def save_notification(markdown_content: str) -> None:
-    """保存通知到文件"""
-    NOTIFICATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with NOTIFICATION_FILE.open("w", encoding="utf-8") as f:
-        f.write(markdown_content)
-    print(f"[通知] 已保存到：{NOTIFICATION_FILE}")
+def send_wechat_message(markdown_content: str, target: str, account_id: str) -> bool:
+    """通过 OpenClaw 发送微信消息"""
+    import subprocess
+    try:
+        # 使用 openclaw message 命令发送
+        cmd = [
+            "openclaw", "message", "send",
+            "--channel", "openclaw-weixin",
+            "--target", target,
+            "--account", account_id,
+            "--message", markdown_content
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            print(f"[通知] 微信消息发送成功 ✓")
+            return True
+        else:
+            print(f"[通知] 发送失败：{result.stderr}", file=sys.stderr)
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"[通知] 发送超时", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"[通知] 发送错误：{e}", file=sys.stderr)
+        return False
 
 
 def get_active_courses(
@@ -240,8 +258,8 @@ def get_active_courses(
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Canvas 轮询检查 + 本地通知")
-    parser.add_argument("--dry-run", action="store_true", help="仅检查，不保存通知")
+    parser = argparse.ArgumentParser(description="Canvas 轮询检查 + 微信通知")
+    parser.add_argument("--dry-run", action="store_true", help="仅检查，不发送通知")
     args = parser.parse_args()
 
     # 加载配置
@@ -252,6 +270,19 @@ def main() -> None:
 
     if not base_url or not token:
         print("[错误] 请在 config/config.yaml 填写 canvas.base_url 与 canvas.access_token", file=sys.stderr)
+        sys.exit(1)
+
+    # 加载通知配置
+    notify = cfg.get("notify") or {}
+    wechat = notify.get("wechat") or {}
+    target = wechat.get("target")
+    account_id = wechat.get("account_id")
+
+    if not target and not args.dry_run:
+        print("[错误] 请在 config/config.yaml 填写 notify.wechat.target (你的微信 ID)", file=sys.stderr)
+        sys.exit(1)
+    if not account_id and not args.dry_run:
+        print("[错误] 请在 config/config.yaml 填写 notify.wechat.account_id", file=sys.stderr)
         sys.exit(1)
 
     # 加载状态
@@ -294,15 +325,17 @@ def main() -> None:
             print("[轮询] 无内容可发送")
             return
 
-        # 保存通知
+        # 发送微信通知
         if args.dry_run:
-            print("[dry-run] 将生成通知:")
+            print("[dry-run] 将发送消息:")
             print(markdown)
         else:
-            save_notification(markdown)
+            success = send_wechat_message(markdown, target, account_id)
             print(f"\n[摘要] 新作业:{len(new_assignments)} 新文件:{len(new_files)} 新公告:{len(new_announcements)}")
             if large_files:
                 print(f"[注意] {len(large_files)} 个文件超过 {SIZE_LIMIT_MB}MB，仅保存链接")
+            if not success:
+                print("[警告] 消息发送失败，但状态已更新", file=sys.stderr)
 
         # 更新状态
         state["last_check"] = datetime.now().isoformat()
