@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
 Canvas 轮询检查脚本
-定期检查通知、作业、新文件，有增量时通过企业微信 Webhook 推送
+定期检查通知、作业、新文件，有增量时生成通知文件
 
 用法:
     python script/canvas_poll.py [--dry-run]
     
 配置:
     - config/config.yaml 中的 canvas 配置
-    - 环境变量 WECHAT_WEBHOOK_KEY (企业微信群机器人 key)
     - state/poll_state.json (自动创建，记录上次检查状态)
+    - state/poll_notification.md (生成的通知文件)
+    
+特点:
+    - 仅增量通知 - 无新内容时不生成通知
+    - 20MB 限制 - 超过 20MB 的文件只记录链接，不下载
+    - 本地通知 - 生成 Markdown 文件供查看
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +31,9 @@ import httpx
 from load_settings import load_config
 
 STATE_FILE = Path(__file__).parent.parent / "state" / "poll_state.json"
-CHECK_WINDOW_HOURS = 24  # 检查最近 24 小时的内容
+NOTIFICATION_FILE = Path(__file__).parent.parent / "state" / "poll_notification.md"
+SIZE_LIMIT_MB = 20
+SIZE_LIMIT_BYTES = SIZE_LIMIT_MB * 1024 * 1024
 
 
 def load_state() -> dict[str, Any]:
@@ -54,27 +61,6 @@ def save_state(state: dict[str, Any]) -> None:
 
 def canvas_auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token.strip()}"}
-
-
-def get_time_window() -> tuple[str, str]:
-    """返回检查时间窗口的 ISO 格式时间"""
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=CHECK_WINDOW_HOURS)
-    return start.isoformat(), now.isoformat()
-
-
-def fetch_notifications(client: httpx.Client, base_url: str, headers: dict[str, str]) -> list[dict[str, Any]]:
-    """获取 Canvas 通知"""
-    url = f"{base_url}/api/v1/communication_channels"
-    try:
-        resp = client.get(url, headers=headers, params={"per_page": 50})
-        resp.raise_for_status()
-        channels = resp.json()
-        # Canvas 通知 API 较复杂，这里简化处理
-        return []
-    except httpx.HTTPError as e:
-        print(f"[通知] 获取失败：{e}", file=sys.stderr)
-        return []
 
 
 def fetch_assignments(
@@ -144,78 +130,118 @@ def filter_new_items(
     return [item for item in items if item.get(id_field) not in notified_ids]
 
 
+def format_size(size_bytes: int) -> str:
+    """格式化文件大小"""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
 def format_markdown_digest(
     assignments: list[dict[str, Any]],
     files: list[dict[str, Any]],
     announcements: list[dict[str, Any]],
+    course_map: dict[int, str],
 ) -> str:
-    """格式化企业微信 Markdown 消息"""
-    lines = ["## 📦 Canvas 更新提醒\n"]
+    """格式化 Markdown 通知"""
+    lines = ["# 📦 Canvas 更新提醒\n"]
+    lines.append(f"_检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}__\n")
 
     if assignments:
-        lines.append("### 📝 新作业")
-        for a in assignments[:5]:  # 最多显示 5 个
+        lines.append("## 📝 新作业\n")
+        for a in assignments:
             title = a.get("name", "未命名")
+            cid = a.get("course_id")
+            course_name = course_map.get(cid, f"课程{cid}")
             due = a.get("due_at")
+            points = a.get("points_possible")
+            
+            lines.append(f"### {title}")
+            lines.append(f"- 课程：{course_name}")
             if due:
                 due_str = due[:16].replace("T", " ")
-                lines.append(f"- **{title}** (截止：{due_str})")
-            else:
-                lines.append(f"- **{title}**")
-        lines.append("")
+                lines.append(f"- 截止：{due_str}")
+            if points is not None:
+                lines.append(f"- 分数：{points}")
+            lines.append("")
 
     if files:
-        lines.append("### 📁 新文件")
-        for f in files[:5]:
+        lines.append("## 📁 新文件\n")
+        for f in files:
             name = f.get("display_name") or f.get("filename", "未命名")
-            lines.append(f"- {name}")
-        lines.append("")
+            cid = f.get("course_id")
+            course_name = course_map.get(cid, f"课程{cid}")
+            size = f.get("size", 0)
+            file_url = f.get("url", "")
+            
+            size_str = format_size(size) if size else "未知"
+            over_limit = size and size > SIZE_LIMIT_BYTES
+            
+            lines.append(f"### {name}")
+            lines.append(f"- 课程：{course_name}")
+            lines.append(f"- 大小：{size_str}" + (" ⚠️ **超过 20MB，不自动下载**" if over_limit else ""))
+            if file_url:
+                lines.append(f"- 链接：{file_url}")
+            lines.append("")
 
     if announcements:
-        lines.append("### 📢 新公告")
-        for ann in announcements[:5]:
+        lines.append("## 📢 新公告\n")
+        for ann in announcements:
             title = ann.get("title", "未命名")
-            lines.append(f"- {title}")
-        lines.append("")
+            cid = ann.get("course_id", ann.get("context_course_id"))
+            course_name = course_map.get(cid, f"课程{cid}")
+            message = ann.get("message", "")[:200]  # 截取前 200 字
+            
+            lines.append(f"### {title}")
+            lines.append(f"- 课程：{course_name}")
+            if message:
+                lines.append(f"- 摘要：{message}...")
+            lines.append("")
 
     if not (assignments or files or announcements):
         return ""  # 无增量
 
-    lines.append(f"_更新时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}__")
+    lines.append("---")
+    lines.append(f"**说明**: 超过 {SIZE_LIMIT_MB}MB 的文件不会自动下载，请手动访问链接。")
     return "\n".join(lines)
 
 
-def send_wechat_webhook(markdown_content: str, webhook_key: str) -> dict[str, Any]:
-    """发送企业微信 Webhook 消息"""
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={webhook_key}"
-    payload = {
-        "msgtype": "markdown",
-        "markdown": {"content": markdown_content},
-    }
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(url, json=payload)
-        resp.raise_for_status()
-        return resp.json()
+def save_notification(markdown_content: str) -> None:
+    """保存通知到文件"""
+    NOTIFICATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with NOTIFICATION_FILE.open("w", encoding="utf-8") as f:
+        f.write(markdown_content)
+    print(f"[通知] 已保存到：{NOTIFICATION_FILE}")
 
 
-def get_active_course_ids(client: httpx.Client, base_url: str, headers: dict[str, str]) -> list[int]:
-    """获取活跃课程 ID 列表"""
+def get_active_courses(
+    client: httpx.Client, base_url: str, headers: dict[str, str]
+) -> tuple[list[int], dict[int, str]]:
+    """获取活跃课程 ID 列表和课程名映射"""
     url = f"{base_url}/api/v1/courses"
     try:
         resp = client.get(url, headers=headers, params={"enrollment_state[]": "active", "per_page": 100})
         resp.raise_for_status()
         courses = resp.json()
-        return [c["id"] for c in courses if isinstance(c, dict) and "id" in c]
+        course_ids = []
+        course_map = {}
+        for c in courses:
+            if isinstance(c, dict) and "id" in c:
+                course_ids.append(c["id"])
+                course_map[c["id"]] = c.get("name") or c.get("course_code") or f"课程{c['id']}"
+        return course_ids, course_map
     except httpx.HTTPError as e:
         print(f"[课程] 获取失败：{e}", file=sys.stderr)
-        return []
+        return [], {}
 
 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Canvas 轮询检查 + 企业微信通知")
-    parser.add_argument("--dry-run", action="store_true", help="仅检查，不发送通知")
+    parser = argparse.ArgumentParser(description="Canvas 轮询检查 + 本地通知")
+    parser.add_argument("--dry-run", action="store_true", help="仅检查，不保存通知")
     args = parser.parse_args()
 
     # 加载配置
@@ -228,18 +254,13 @@ def main() -> None:
         print("[错误] 请在 config/config.yaml 填写 canvas.base_url 与 canvas.access_token", file=sys.stderr)
         sys.exit(1)
 
-    webhook_key = os.environ.get("WECHAT_WEBHOOK_KEY")
-    if not webhook_key and not args.dry_run:
-        print("[错误] 请设置环境变量 WECHAT_WEBHOOK_KEY", file=sys.stderr)
-        sys.exit(1)
-
     # 加载状态
     state = load_state()
     headers = canvas_auth_headers(token)
 
     with httpx.Client(timeout=60.0) as client:
         # 获取课程列表
-        course_ids = get_active_course_ids(client, base_url, headers)
+        course_ids, course_map = get_active_courses(client, base_url, headers)
         if not course_ids:
             print("[轮询] 无活跃课程")
             return
@@ -256,7 +277,11 @@ def main() -> None:
         new_files = filter_new_items(files, state.get("notified_files", []))
         new_announcements = filter_new_items(announcements, state.get("notified_announcements", []))
 
-        print(f"[轮询] 新作业:{len(new_assignments)} 新文件:{len(new_files)} 新公告:{len(new_announcements)}")
+        # 统计超过 20MB 的文件
+        large_files = [f for f in new_files if f.get("size", 0) > SIZE_LIMIT_BYTES]
+        normal_files = [f for f in new_files if f.get("size", 0) <= SIZE_LIMIT_BYTES]
+
+        print(f"[轮询] 新作业:{len(new_assignments)} 新文件:{len(new_files)} (>{SIZE_LIMIT_MB}MB:{len(large_files)}) 新公告:{len(new_announcements)}")
 
         # 无增量则退出
         if not (new_assignments or new_files or new_announcements):
@@ -264,23 +289,20 @@ def main() -> None:
             return
 
         # 格式化消息
-        markdown = format_markdown_digest(new_assignments, new_files, new_announcements)
+        markdown = format_markdown_digest(new_assignments, new_files, new_announcements, course_map)
         if not markdown:
             print("[轮询] 无内容可发送")
             return
 
-        # 发送通知
+        # 保存通知
         if args.dry_run:
-            print("[dry-run] 将发送消息:")
+            print("[dry-run] 将生成通知:")
             print(markdown)
         else:
-            print(f"[通知] 发送企业微信消息...")
-            result = send_wechat_webhook(markdown, webhook_key)
-            if result.get("errcode") == 0:
-                print("[通知] 发送成功 ✓")
-            else:
-                print(f"[通知] 发送失败：{result}", file=sys.stderr)
-                sys.exit(1)
+            save_notification(markdown)
+            print(f"\n[摘要] 新作业:{len(new_assignments)} 新文件:{len(new_files)} 新公告:{len(new_announcements)}")
+            if large_files:
+                print(f"[注意] {len(large_files)} 个文件超过 {SIZE_LIMIT_MB}MB，仅保存链接")
 
         # 更新状态
         state["last_check"] = datetime.now().isoformat()

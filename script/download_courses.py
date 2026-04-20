@@ -1,6 +1,8 @@
 """
 使用 Canvas API 下载当前用户 active 注册课程的文件。
 -init：列出课程并确认后下载；匹配 folder_only 规则的课程仅创建目录。
+
+20MB 限制：超过 20MB 的文件不下载，保存.url 链接文件。
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ import httpx
 from load_settings import load_config
 
 INVALID_WIN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+SIZE_LIMIT_MB = 20
+SIZE_LIMIT_BYTES = SIZE_LIMIT_MB * 1024 * 1024
 
 
 def sanitize_path_segment(name: str, fallback: str = "untitled") -> str:
@@ -77,10 +82,6 @@ def active_courses_rows_from_courses_api(
     headers: dict[str, str],
     enrollment_states: list[str],
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """
-    与网页「课程」列表一致：List your courses。
-    部分学校 enrollments+include=course 不返回嵌套 course，此处更可靠。
-    """
     url = f"{base_url}/api/v1/courses"
     params: list[tuple[str, Any]] = [
         ("include[]", "sections"),
@@ -103,14 +104,12 @@ def enrollment_active_course_rows(
     headers: dict[str, str],
     enrollment_states: list[str],
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """后备：enrollments 接口；仅保留带嵌套 course 对象的条目。"""
     url = f"{base_url}/api/v1/users/self/enrollments"
     params: list[tuple[str, Any]] = [
         ("include[]", "course"),
         ("include[]", "term"),
         ("per_page", 100),
     ]
-    # enrollments 的 state[] 与 courses 的 enrollment_state[] 取值略有不同
     enroll_map = {"invited_or_pending": "invited"}
     for s in enrollment_states:
         params.append(("state[]", enroll_map.get(s, s)))
@@ -142,7 +141,6 @@ def collect_course_rows(
 
 
 def term_label_blob(enrollment: dict[str, Any], course: dict[str, Any]) -> str:
-    """拼接学期展示名与 SIS ID 等，供子串匹配。"""
     term: dict[str, Any] | None = None
     t0 = course.get("term")
     if isinstance(t0, dict):
@@ -166,7 +164,6 @@ def filter_rows_by_term_substrings(
     rows: list[tuple[dict[str, Any], dict[str, Any]]],
     substrings: list[str],
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """仅保留学期标签文本中包含任一则子串的课程；无学期信息的不保留。"""
     if not substrings:
         return rows
     out: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -182,7 +179,6 @@ def filter_rows_by_term_substrings(
 def dedupe_courses(
     rows: list[tuple[dict[str, Any], dict[str, Any]]],
 ) -> dict[int, tuple[list[dict[str, Any]], dict[str, Any]]]:
-    """course_id -> (该课所有 enrollments, 代表 course 对象)。"""
     by_id: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
     for enr, course in rows:
         cid = int(course["id"])
@@ -238,7 +234,6 @@ def course_is_folder_only(
                 return True
         return False
 
-    # 列表未带 sections 时再请求详情；部分学校对学生令牌禁止 GET /courses/:id，会 401
     try:
         detail = client.get(
             f"{base_url}/api/v1/courses/{course_id}",
@@ -281,7 +276,6 @@ def folder_full_name_cached(
 
 
 def relative_dir_from_folder_full_name(full_name: str) -> Path:
-    """把 Canvas full_name 转成相对路径；去掉常见根前缀。"""
     parts = [p for p in full_name.replace("\\", "/").split("/") if p and p != "."]
     drop_prefixes = ("course files", "files", "course_files")
     while parts and parts[0].lower() in drop_prefixes:
@@ -290,7 +284,6 @@ def relative_dir_from_folder_full_name(full_name: str) -> Path:
 
 
 def strip_access_token_from_url(url: str) -> str:
-    """避免在日志里打印带 access_token 的 URL。"""
     try:
         p = urlparse(url)
         q = parse_qs(p.query, keep_blank_values=True)
@@ -305,22 +298,50 @@ def strip_access_token_from_url(url: str) -> str:
         return url
 
 
+def format_size(size_bytes: int) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
+def save_file_link(file_info: dict[str, Any], target_dir: Path, display: str) -> Path:
+    file_url = file_info.get("url", "")
+    file_size = file_info.get("size", 0)
+    size_str = format_size(file_size) if file_size else "未知"
+    
+    link_path = target_dir / f"{display}.url"
+    link_content = f"""[InternetShortcut]
+URL={file_url}
+FileSize={size_str}
+Info=文件大小超过{SIZE_LIMIT_MB}MB，请手动下载
+"""
+    with link_path.open("w", encoding="utf-8") as f:
+        f.write(link_content)
+    return link_path
+
+
 def download_course_files(
     client: httpx.Client,
     base_url: str,
     headers: dict[str, str],
     course_id: int,
     course_dir: Path,
-) -> tuple[int, int]:
-    """返回 (成功数, 跳过/失败数)。"""
+) -> tuple[int, int, int]:
+    """返回 (成功数，跳过/失败数，超过大小限制数)。"""
     url = f"{base_url}/api/v1/courses/{course_id}/files"
     params: dict[str, Any] = {"per_page": 100}
     folder_cache: dict[int, str] = {}
     ok = 0
     bad = 0
+    over_limit = 0
+    
     for f in paginate_get_list(client, url, headers, params):
         display = f.get("display_name") or f.get("filename") or f"file_{f.get('id')}"
         fid = f.get("folder_id")
+        file_size = f.get("size", 0)
+        
         rel = Path()
         if fid is not None:
             full = folder_full_name_cached(client, base_url, headers, folder_cache, int(fid))
@@ -336,6 +357,16 @@ def download_course_files(
         if not file_url:
             bad += 1
             continue
+        
+        # 检查文件大小限制
+        if file_size and file_size > SIZE_LIMIT_BYTES:
+            size_str = format_size(file_size)
+            print(f"  ⚠️ 跳过 (>{SIZE_LIMIT_MB}MB): {display} ({size_str})", file=sys.stderr)
+            link_path = save_file_link(f, target_dir, display)
+            print(f"    已保存链接：{link_path}", file=sys.stderr)
+            over_limit += 1
+            continue
+        
         try:
             with client.stream("GET", str(file_url), headers=headers, follow_redirects=True, timeout=120.0) as resp:
                 resp.raise_for_status()
@@ -346,7 +377,7 @@ def download_course_files(
         except httpx.HTTPError:
             bad += 1
             print(f"  跳过文件：{display} ({strip_access_token_from_url(str(file_url))})", file=sys.stderr)
-    return ok, bad
+    return ok, bad, over_limit
 
 
 def unique_course_dir(root: Path, course_name: str, course_id: int) -> Path:
@@ -453,7 +484,7 @@ def main() -> None:
         for cid, course, enrs, folder_only, course_dir in plans:
             flag = " [仅创建目录，不下载文件]" if folder_only else ""
             tlabel = term_label_blob(enrs[0] if enrs else {}, course) or "（无）"
-            print(f"- {course.get('name') or course.get('course_code')} (id={cid})  学期: {tlabel}{flag}")
+            print(f"- {course.get('name') or course.get('course_code')} (id={cid})  学期：{tlabel}{flag}")
             print(f"  -> {course_dir}{flag}")
 
         if args.yes:
@@ -472,8 +503,8 @@ def main() -> None:
                 print(f"仅创建目录：{title}")
                 continue
             print(f"下载课程文件：{title}")
-            ok, bad = download_course_files(client, base_url, headers, cid, course_dir)
-            print(f"  完成：成功 {ok}，失败/跳过 {bad}")
+            ok, bad, over_limit = download_course_files(client, base_url, headers, cid, course_dir)
+            print(f"  完成：成功 {ok}，失败/跳过 {bad}，超过{SIZE_LIMIT_MB}MB {over_limit}")
 
 
 if __name__ == "__main__":
