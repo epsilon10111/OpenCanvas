@@ -1,0 +1,21 @@
+canvas:
+  # Canvas 实例根地址
+  base_url: "https://YOUR_CANVAS_HOST"
+  # Canvas API Token
+  access_token: "YOUR_ACCESS_TOKEN"
+
+download:
+  root: "YOUR_DOWNLOAD_ROOT_PATH"
+  folder_only_if_contains:
+    - "YOUR_FOLDER_ONLY_KEYWORD"
+
+# 轮询通知配置
+poll:
+  # 检查时间窗口（小时），只检查这个时间段内的新内容
+  check_window_hours: 24
+  # 是否启用各类检查
+  check_assignments: true
+  check_files: true
+  check_announcements: true
+  # 每类最多显示数量
+  max_items_per_type: 5
