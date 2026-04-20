@@ -50,9 +50,9 @@ cat state/poll_notification.md
 crontab -e
 ```
 
-添加以下行（每 30 分钟检查一次）：
+添加以下行（每 10 分钟检查一次）：
 ```cron
-*/30 * * * * cd /home/admin/OpenCanvas && .venv/bin/python script/canvas_poll.py >> logs/poll.log 2>&1
+*/10 * * * * cd /home/admin/OpenCanvas && .venv/bin/python script/canvas_poll.py >> logs/poll.log 2>&1
 ```
 
 ### 方案 B: 使用 setup_cron.sh 脚本
@@ -155,7 +155,7 @@ _检查时间：2026-04-20 17:30:00_
 
 ### 频率限制
 - Canvas API 有速率限制，建议检查间隔 ≥5 分钟
-- 默认 30 分钟检查一次较为安全
+- 默认 10 分钟检查一次，既能及时通知又不会过于频繁
 
 ### 失败处理
 - 网络错误会写入日志，不影响状态文件

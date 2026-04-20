@@ -2,7 +2,7 @@
 # 设置 Canvas 轮询的 crontab 任务
 # 用法：./setup_cron.sh [interval_minutes]
 
-INTERVAL=${1:-30}  # 默认 30 分钟
+INTERVAL=${1:-10}  # 默认 10 分钟
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
