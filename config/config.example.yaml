@@ -1,0 +1,24 @@
+canvas:
+  # 实例根地址，不要带 /api/v1（按你学校 Canvas 域名填写）
+  base_url: "https://YOUR_CANVAS_HOST"
+  # Canvas「设置 → 新访问令牌」生成的 API Token
+  access_token: "YOUR_ACCESS_TOKEN"
+
+download:
+  # 课程文件夹与文件保存根目录（Windows 示例：D:\\path\\to\\folder）
+  root: "YOUR_DOWNLOAD_ROOT_PATH"
+  # 学期过滤：只保留「学期: …」文案中含下列任一字串的课程（脚本打印的学期来自 term 等字段拼接，不区分大小写）。
+  # 先跑一次 -init 看每门课打印的学期行，把能唯一区分本学期的关键词填进列表；不写 term_filter 或 name_substrings 为空则不过滤。
+  term_filter:
+    name_substrings:
+      - "YOUR_TERM_KEYWORD"
+      # - "2025-2026 Spring"
+      # - "2026春"
+  # 与 Canvas「课程列表」一致的注册状态（默认仅 active）。网页能看课但列表为空时可加 invited_or_pending、completed 等。
+  # enrollment_states:
+  #   - active
+  #   - invited_or_pending
+  # 若课程名 / 班级(sections)名 / 注册 role 等文本中包含下列任一串（不区分大小写），
+  # 则仅创建课程目录，不下载该课文件。
+  folder_only_if_contains:
+    - "YOUR_FOLDER_ONLY_KEYWORD"

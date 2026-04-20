@@ -1,0 +1,11 @@
+name: opencanvas
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - httpx
+  - pydantic>=2
+  - pyyaml
+  - rich
+  - python-dotenv
