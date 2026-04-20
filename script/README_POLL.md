@@ -2,12 +2,12 @@
 
 ## 📦 功能说明
 
-定时检查 Canvas 的**新作业、新文件、新公告**，有增量时生成 Markdown 通知文件。
+定时检查 Canvas 的**新作业、新文件、新公告**，有增量时通过微信发送通知。
 
 **特点：**
-- ✅ 仅增量通知 - 无新内容时不生成通知文件
+- ✅ 仅增量通知 - 无新内容时不发送消息 (0 打扰)
 - ✅ 20MB 限制 - 超过 20MB 的文件只记录链接，不下载
-- ✅ 本地通知 - 生成 `state/poll_notification.md` 文件
+- ✅ 微信通知 - 直接发送消息到微信聊天
 - ✅ 可配置检查窗口 - 默认检查最近 24 小时
 
 ---
@@ -23,21 +23,30 @@ canvas:
   access_token: "YOUR_CANVAS_TOKEN"
 ```
 
-### 2. 测试运行
+### 2. 配置微信通知
+
+在 `config/config.yaml` 中添加：
+```yaml
+notify:
+  wechat:
+    target: "你的微信 ID@im.wechat"        # 从聊天上下文获取
+    account_id: "你的账号 ID-im-bot"       # 从聊天上下文获取
+```
+
+**获取方法：**
+- `target`: 当前聊天的 chat_id (格式如 `o9cq8067r57_xxx@im.wechat`)
+- `account_id`: OpenClaw 微信账号 ID (格式如 `fc9e8e358015-im-bot`)
+
+### 3. 测试运行
 
 ```bash
 cd /home/admin/OpenCanvas
 
-# 干跑测试（不生成通知文件）
+# 干跑测试（不发送消息）
 python script/canvas_poll.py --dry-run
 
-# 正式运行
+# 正式运行（有更新时会发微信消息）
 python script/canvas_poll.py
-```
-
-运行后查看生成的通知文件：
-```bash
-cat state/poll_notification.md
 ```
 
 ---
