@@ -37,6 +37,20 @@ STATE_FILE = Path(__file__).parent.parent / "state" / "poll_state.json"
 NOTIFICATION_FILE = Path(__file__).parent.parent / "state" / "poll_notification.md"
 SIZE_LIMIT_MB = 20
 SIZE_LIMIT_BYTES = SIZE_LIMIT_MB * 1024 * 1024
+
+# 导入 Assignment Solver 模块
+try:
+    from assignment_solver import (
+        format_assignment_notification,
+        send_wechat_message,
+        canvas_auth_headers as solver_auth_headers,
+        get_course_map,
+        fetch_all_assignments,
+    )
+    from state_manager import AssignmentState
+    HAS_SOLVER = True
+except ImportError:
+    HAS_SOLVER = False
 DIVIDER = "━━━━━━━━━━━━━━━━━━"
 
 
@@ -501,6 +515,28 @@ def main() -> None:
         assignments = fetch_assignments(client, base_url, headers, course_ids)
         files = fetch_recent_files(client, base_url, headers, course_ids)
         announcements = fetch_announcements(client, base_url, headers, course_ids)
+
+        # ── 检查新作业（Assignment Solver）──
+        if HAS_SOLVER and not args.dry_run:
+            try:
+                from assignment_solver import check_new_assignments, send_wechat_message as solver_send
+                new_assignments = check_new_assignments(dry_run=False)
+                if new_assignments:
+                    print(f"[作业] 发现 {len(new_assignments)} 个新作业")
+                    notify = cfg.get("notify") or {}
+                    wechat = notify.get("wechat") or {}
+                    target = wechat.get("target")
+                    account_id = wechat.get("account_id")
+
+                    for a in new_assignments:
+                        msg = format_assignment_notification(a)
+                        if target and account_id:
+                            solver_send(msg, target, account_id)
+                        print(f"[作业] 已通知: {a.get('name', '')}")
+                else:
+                    print("[作业] 没有新作业")
+            except Exception as e:
+                print(f"[作业] 检查失败: {e}", file=sys.stderr)
 
         # 过滤增量
         new_assignments = filter_new_items(assignments, state.get("notified_assignments", []))
