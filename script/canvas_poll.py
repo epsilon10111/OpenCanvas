@@ -37,6 +37,7 @@ STATE_FILE = Path(__file__).parent.parent / "state" / "poll_state.json"
 NOTIFICATION_FILE = Path(__file__).parent.parent / "state" / "poll_notification.md"
 SIZE_LIMIT_MB = 20
 SIZE_LIMIT_BYTES = SIZE_LIMIT_MB * 1024 * 1024
+DIVIDER = "━━━━━━━━━━━━━━━━━━"
 
 
 class HTMLToTextParser(HTMLParser):
@@ -73,7 +74,7 @@ class HTMLToTextParser(HTMLParser):
             if src:
                 img_url = urljoin(self.base_url, src)
                 self.images.append(img_url)
-                return
+            return
 
         if tag == "br":
             self.text_parts.append("\n")
@@ -106,7 +107,6 @@ class HTMLToTextParser(HTMLParser):
 
     def get_text(self) -> str:
         raw = "".join(self.text_parts)
-        # 压缩多余空白行
         lines = raw.split("\n")
         cleaned = []
         blank_count = 0
@@ -122,18 +122,14 @@ class HTMLToTextParser(HTMLParser):
 
 
 def html_to_readable(html_content: str, base_url: str = "") -> tuple[str, list[str]]:
-    """
-    将 HTML 内容转换为可读文本，返回 (文本, 图片URL列表)
-    """
+    """将 HTML 内容转换为可读文本，返回 (文本, 图片URL列表)"""
     if not html_content:
         return "", []
 
-    # 简单清理常见 HTML 包装
     parser = HTMLToTextParser(base_url)
     try:
         parser.feed(html_content)
     except Exception:
-        # 解析失败时回退到纯文本
         return strip_html_tags(html_content), []
 
     return parser.get_text(), parser.images
@@ -194,6 +190,8 @@ def fetch_assignments(
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list):
+                for a in data:
+                    a["_course_id"] = cid  # 注入课程 ID
                 assignments.extend(data)
         except httpx.HTTPError as e:
             print(f"[作业] 课程{cid}获取失败：{e}", file=sys.stderr)
@@ -212,6 +210,8 @@ def fetch_recent_files(
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list):
+                for f in data:
+                    f["_course_id"] = cid  # 注入课程 ID
                 files.extend(data)
         except httpx.HTTPError as e:
             print(f"[文件] 课程{cid}获取失败：{e}", file=sys.stderr)
@@ -230,6 +230,8 @@ def fetch_announcements(
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list):
+                for a in data:
+                    a["_course_id"] = cid  # 注入课程 ID
                 announcements.extend(data)
         except httpx.HTTPError as e:
             print(f"[公告] 课程{cid}获取失败：{e}", file=sys.stderr)
@@ -254,6 +256,11 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def get_course_id(item: dict[str, Any]) -> int | None:
+    """获取项目的课程 ID（优先使用我们注入的 _course_id）"""
+    return item.get("_course_id") or item.get("course_id") or item.get("context_course_id") or item.get("context_id")
+
+
 def format_announcement(ann: dict[str, Any], course_name: str, base_url: str) -> str:
     """格式化单个公告为微信友好的可读格式"""
     title = ann.get("title", "未命名")
@@ -261,7 +268,7 @@ def format_announcement(ann: dict[str, Any], course_name: str, base_url: str) ->
     posted_at = ann.get("posted_at") or ann.get("created_at")
     message_html = ann.get("message", "")
     ann_id = ann.get("id", "")
-    cid = ann.get("course_id", ann.get("context_course_id", ""))
+    cid = get_course_id(ann)
 
     # 转换 HTML 为可读文本，提取图片
     message_text, images = html_to_readable(message_html, base_url)
@@ -296,13 +303,10 @@ def format_announcement(ann: dict[str, Any], course_name: str, base_url: str) ->
     return "\n".join(lines)
 
 
-DIVIDER = "━━━━━━━━━━━━━━━━━━"
-
-
 def format_assignment(a: dict[str, Any], course_name: str, base_url: str) -> str:
     """格式化单个作业为微信友好的可读格式"""
     title = a.get("name", "未命名")
-    cid = a.get("course_id")
+    cid = get_course_id(a)
     due = a.get("due_at")
     points = a.get("points_possible")
     description = a.get("description", "")
@@ -333,7 +337,7 @@ def format_assignment(a: dict[str, Any], course_name: str, base_url: str) -> str
 def format_file_item(f: dict[str, Any], course_name: str) -> str:
     """格式化单个文件为微信友好的可读格式"""
     name = f.get("display_name") or f.get("filename", "未命名")
-    cid = f.get("course_id")
+    cid = get_course_id(f)
     size = f.get("size", 0)
     file_url = f.get("url", "")
 
@@ -369,8 +373,8 @@ def format_markdown_digest(
     # ── 公告 ──
     if announcements:
         for ann in announcements:
-            cid = ann.get("course_id", ann.get("context_course_id"))
-            course_name = course_map.get(cid, f"课程{cid}")
+            cid = get_course_id(ann)
+            course_name = course_map.get(cid, f"课程{cid}") if cid else "未知课程"
             lines.append(format_announcement(ann, course_name, base_url))
             lines.append("")
             lines.append(DIVIDER)
@@ -379,8 +383,8 @@ def format_markdown_digest(
     # ── 作业 ──
     if assignments:
         for a in assignments:
-            cid = a.get("course_id")
-            course_name = course_map.get(cid, f"课程{cid}")
+            cid = get_course_id(a)
+            course_name = course_map.get(cid, f"课程{cid}") if cid else "未知课程"
             lines.append(format_assignment(a, course_name, base_url))
             lines.append("")
             lines.append(DIVIDER)
@@ -389,8 +393,8 @@ def format_markdown_digest(
     # ── 文件 ──
     if files:
         for fi in files:
-            cid = fi.get("course_id")
-            course_name = course_map.get(cid, f"课程{cid}")
+            cid = get_course_id(fi)
+            course_name = course_map.get(cid, f"课程{cid}") if cid else "未知课程"
             lines.append(format_file_item(fi, course_name))
             lines.append("")
             lines.append(DIVIDER)
@@ -493,7 +497,7 @@ def main() -> None:
 
         print(f"[轮询] 检查 {len(course_ids)} 门课程...")
 
-        # 获取各类内容
+        # 获取各类内容（函数内会注入 _course_id）
         assignments = fetch_assignments(client, base_url, headers, course_ids)
         files = fetch_recent_files(client, base_url, headers, course_ids)
         announcements = fetch_announcements(client, base_url, headers, course_ids)
