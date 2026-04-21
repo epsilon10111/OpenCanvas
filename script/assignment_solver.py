@@ -101,34 +101,65 @@ def fetch_all_assignments(
 
 
 def get_course_dir(course_id: int, course_name: str = "") -> Path:
-    """获取课程文件目录"""
-    if course_name:
-        # 尝试在 COURSE_ROOT 下查找
-        for d in COURSE_ROOT.iterdir():
-            if d.is_dir() and str(course_id) in d.name:
-                return d
+    """获取课程文件目录
+    课程目录名通常是像 TC3000JSP2026-1 这样的代码，不包含 course_id
+    需要通过课程名称中的课程代码来匹配
+    """
+    if COURSE_ROOT.exists():
+        # 优先按课程名称中的课程代码匹配（如 TC3000J, ECE2160 等）
+        if course_name:
+            # 提取课程代码部分（如 TC3000JSP2026-1 -> TC3000）
+            import re
+            code_match = re.match(r'([A-Z]+\d+)', course_name)
+            if code_match:
+                course_code = code_match.group(1)
+                for d in COURSE_ROOT.iterdir():
+                    if d.is_dir() and course_code.lower() in d.name.lower():
+                        return d
+        # 按目录名包含 course_name 匹配
+        if course_name:
+            for d in COURSE_ROOT.iterdir():
+                if d.is_dir() and course_name.lower() in d.name.lower():
+                    return d
     # 回退：用课程 ID 构建路径
     return COURSE_ROOT / f"course_{course_id}"
 
 
 def call_llm(prompt: str, system_prompt: str = None, temperature: float = 0.7) -> str:
     """调用 LLM API 生成内容"""
-    cfg = load_config()
-    canvas = cfg.get("canvas") or {}
-    token = str(canvas.get("access_token", "")).strip()
-
-    # 使用 OpenAI 兼容 API
-    base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    api_key = token  # 如果 canvas token 也是 dashscope 的
-
-    # 尝试从 models config 获取 API key
-    models_cfg = cfg.get("models") or {}
-    providers = models_cfg.get("providers") or {}
-    if "qwenProvider" in providers:
-        api_key = providers["qwenProvider"].get("apiKey", "")
+    import os
+    # 优先级: 环境变量 > OpenClaw 配置 > Canvas config
+    api_key = os.environ.get("LLM_API_KEY", "")
+    base_url = os.environ.get("LLM_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 
     if not api_key:
-        raise RuntimeError("未找到 LLM API Key，请在 config/config.yaml 中配置 models.providers.qwenProvider.apiKey")
+        try:
+            # 尝试从 OpenClaw 配置读取
+            openclaw_config = Path.home() / ".openclaw" / "openclaw.json"
+            if openclaw_config.exists():
+                with open(openclaw_config, "r") as f:
+                    oc_cfg = json.load(f)
+                providers = oc_cfg.get("models", {}).get("providers", {})
+                if "qwenProvider" in providers:
+                    api_key = providers["qwenProvider"].get("apiKey", "")
+        except Exception:
+            pass
+
+    if not api_key:
+        # 尝试从 canvas config 的 models 部分读取
+        cfg = load_config()
+        models_cfg = cfg.get("models") or {}
+        providers = models_cfg.get("providers") or {}
+        if "qwenProvider" in providers:
+            api_key = providers["qwenProvider"].get("apiKey", "")
+
+    if not api_key:
+        raise RuntimeError(
+            "未找到 LLM API Key。请以下列方式之一配置:\n"
+            "1. 环境变量 LLM_API_KEY\n"
+            "2. OpenClaw 配置 (openclaw.json) 中的 models.providers.qwenProvider.apiKey\n"
+            "3. Canvas config/config.yaml 中的 models.providers.qwenProvider.apiKey"
+        )
 
     messages = []
     if system_prompt:
