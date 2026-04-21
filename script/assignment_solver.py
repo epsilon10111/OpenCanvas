@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -427,12 +427,15 @@ def check_new_assignments(dry_run: bool = False) -> list[dict[str, Any]]:
 
         assignments = fetch_all_assignments(client, base_url, headers, course_ids)
 
-        # 过滤：只保留未提交的、未到期的作业
+        # 过滤：只保留未提交的、未过期且在未来 30 天内的作业
+        now = datetime.now(timezone.utc)
         new_assignments = []
         for a in assignments:
             aid = a.get("id")
             if not aid or state.exists(aid):
                 continue
+
+            due_at = a.get("due_at")
 
             # 检查是否已提交
             submission = a.get("submission")
@@ -443,13 +446,45 @@ def check_new_assignments(dry_run: bool = False) -> list[dict[str, Any]]:
                     "course_name": course_map.get(a.get("_course_id"), ""),
                     "title": a.get("name", ""),
                     "description": a.get("description", ""),
-                    "due_at": a.get("due_at"),
-                    "status": "completed",  # 已提交
+                    "due_at": due_at,
+                    "status": "completed",
                     "completed_at": datetime.now().isoformat(),
                 })
                 continue
 
-            # 未提交的新作业
+            # 跳过已过期的作业（标记为已完成）
+            if due_at:
+                try:
+                    due_dt = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+                    if due_dt < now:
+                        state.add({
+                            "id": aid,
+                            "course_id": a.get("_course_id"),
+                            "course_name": course_map.get(a.get("_course_id"), ""),
+                            "title": a.get("name", ""),
+                            "description": a.get("description", ""),
+                            "due_at": due_at,
+                            "status": "completed",
+                            "completed_at": datetime.now().isoformat(),
+                        })
+                        continue
+                    # 跳过超过 30 天的作业
+                    if (due_dt - now).days > 30:
+                        state.add({
+                            "id": aid,
+                            "course_id": a.get("_course_id"),
+                            "course_name": course_map.get(a.get("_course_id"), ""),
+                            "title": a.get("name", ""),
+                            "description": a.get("description", ""),
+                            "due_at": due_at,
+                            "status": "completed",
+                            "completed_at": datetime.now().isoformat(),
+                        })
+                        continue
+                except Exception:
+                    pass
+
+            # 未提交的新作业（未过期）
             a["course_name"] = course_map.get(a.get("_course_id"), "")
             new_assignments.append(a)
 
@@ -460,7 +495,7 @@ def check_new_assignments(dry_run: bool = False) -> list[dict[str, Any]]:
                 "course_name": a["course_name"],
                 "title": a.get("name", ""),
                 "description": a.get("description", ""),
-                "due_at": a.get("due_at"),
+                "due_at": due_at,
             })
 
     return new_assignments
@@ -649,15 +684,15 @@ def solve_assignment(assignment_id: int) -> dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser(description="Assignment Solver")
-    group = parser.add_mutually_exclusive_group()
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--check", action="store_true", help="检查新作业")
     group.add_argument("--solve", type=int, metavar="ID", help="完成指定作业")
     group.add_argument("--list-pending", action="store_true", help="列出待确认作业")
-    group.add_argument("--dry-run", action="store_true", help="检查新作业（不通知）")
+    parser.add_argument("--dry-run", action="store_true", help="检查新作业（不通知）")
 
     args = parser.parse_args()
 
-    if args.check or args.dry_run:
+    if args.check:
         new_assignments = check_new_assignments(dry_run=args.dry_run)
         if new_assignments:
             print(f"发现 {len(new_assignments)} 个新作业：")
@@ -666,6 +701,16 @@ def main():
                 print()
         else:
             print("没有新作业")
+
+    elif args.dry_run:
+        new_assignments = check_new_assignments(dry_run=True)
+        if new_assignments:
+            print(f"[dry-run] 发现 {len(new_assignments)} 个新作业：")
+            for a in new_assignments:
+                print(format_assignment_notification(a))
+                print()
+        else:
+            print("[dry-run] 没有新作业")
 
     elif args.solve:
         result = solve_assignment(args.solve)
