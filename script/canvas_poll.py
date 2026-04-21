@@ -255,26 +255,28 @@ def format_size(size_bytes: int) -> str:
 
 
 def format_announcement(ann: dict[str, Any], course_name: str, base_url: str) -> str:
-    """格式化单个公告为可读文本"""
+    """格式化单个公告为微信友好的可读格式"""
     title = ann.get("title", "未命名")
     author = ann.get("user_name") or ann.get("author_name") or "未知"
     posted_at = ann.get("posted_at") or ann.get("created_at")
     message_html = ann.get("message", "")
+    ann_id = ann.get("id", "")
+    cid = ann.get("course_id", ann.get("context_course_id", ""))
 
     # 转换 HTML 为可读文本，提取图片
     message_text, images = html_to_readable(message_html, base_url)
 
     lines = []
-    lines.append(f"【公告】{title}")
-    lines.append(f"课程：{course_name}")
-    lines.append(f"发布者：{author}")
+    lines.append(f"**📢 公告 | {title}**")
+    lines.append("")
+    lines.append(f"▸ 课程：{course_name}")
+    lines.append(f"▸ 发布者：{author}")
     if posted_at:
         try:
-            # 解析 ISO 时间
             dt = datetime.fromisoformat(posted_at.replace("Z", "+00:00"))
-            lines.append(f"时间：{dt.strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"▸ 时间：{dt.strftime('%Y-%m-%d %H:%M')}")
         except Exception:
-            lines.append(f"时间：{posted_at[:16].replace('T', ' ')}")
+            lines.append(f"▸ 时间：{posted_at[:16].replace('T', ' ')}")
 
     if message_text:
         lines.append("")
@@ -286,6 +288,66 @@ def format_announcement(ann: dict[str, Any], course_name: str, base_url: str) ->
         for img_url in images:
             lines.append(f"[图片] {img_url}")
 
+    # 原文链接
+    if cid and ann_id:
+        lines.append("")
+        lines.append(f"🔗 原文链接：{base_url}/courses/{cid}/discussion_topics/{ann_id}")
+
+    return "\n".join(lines)
+
+
+DIVIDER = "━━━━━━━━━━━━━━━━━━"
+
+
+def format_assignment(a: dict[str, Any], course_name: str, base_url: str) -> str:
+    """格式化单个作业为微信友好的可读格式"""
+    title = a.get("name", "未命名")
+    cid = a.get("course_id")
+    due = a.get("due_at")
+    points = a.get("points_possible")
+    description = a.get("description", "")
+    aid = a.get("id", "")
+
+    desc_text = ""
+    if description:
+        desc_text = html_to_readable(description, base_url)[0]
+
+    lines = []
+    lines.append(f"**📝 作业 | {title}**")
+    lines.append("")
+    lines.append(f"▸ 课程：{course_name}")
+    if due:
+        due_str = due[:16].replace("T", " ")
+        lines.append(f"▸ 截止：{due_str}")
+    if points is not None:
+        lines.append(f"▸ 分数：{points}")
+    if desc_text:
+        lines.append("")
+        lines.append(desc_text)
+    if cid and aid:
+        lines.append("")
+        lines.append(f"🔗 查看详情：{base_url}/courses/{cid}/assignments/{aid}")
+    return "\n".join(lines)
+
+
+def format_file_item(f: dict[str, Any], course_name: str) -> str:
+    """格式化单个文件为微信友好的可读格式"""
+    name = f.get("display_name") or f.get("filename", "未命名")
+    cid = f.get("course_id")
+    size = f.get("size", 0)
+    file_url = f.get("url", "")
+
+    size_str = format_size(size) if size else "未知"
+    over_limit = size and size > SIZE_LIMIT_BYTES
+    hint = " ⚠️ 超过 20MB，不自动下载" if over_limit else ""
+
+    lines = []
+    lines.append(f"**📁 文件 | {name}**")
+    lines.append("")
+    lines.append(f"▸ 课程：{course_name}")
+    lines.append(f"▸ 大小：{size_str}{hint}")
+    if file_url:
+        lines.append(f"▸ 链接：{file_url}")
     return "\n".join(lines)
 
 
@@ -299,7 +361,9 @@ def format_markdown_digest(
     """格式化微信友好的通知内容"""
     lines = []
     lines.append("📦 Canvas 更新提醒")
-    lines.append(f"检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"▸ 检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append(DIVIDER)
     lines.append("")
 
     # ── 公告 ──
@@ -309,60 +373,32 @@ def format_markdown_digest(
             course_name = course_map.get(cid, f"课程{cid}")
             lines.append(format_announcement(ann, course_name, base_url))
             lines.append("")
-            lines.append("─" * 20)
+            lines.append(DIVIDER)
             lines.append("")
 
     # ── 作业 ──
     if assignments:
-        lines.append("📝 新作业")
-        lines.append("")
         for a in assignments:
-            title = a.get("name", "未命名")
             cid = a.get("course_id")
             course_name = course_map.get(cid, f"课程{cid}")
-            due = a.get("due_at")
-            points = a.get("points_possible")
-            description = a.get("description", "")
-
-            lines.append(f"【作业】{title}")
-            lines.append(f"课程：{course_name}")
-            if due:
-                due_str = due[:16].replace("T", " ")
-                lines.append(f"截止：{due_str}")
-            if points is not None:
-                lines.append(f"分数：{points}")
-            if description:
-                desc_text = html_to_readable(description, base_url)[0]
-                if desc_text:
-                    lines.append("")
-                    lines.append(desc_text)
+            lines.append(format_assignment(a, course_name, base_url))
+            lines.append("")
+            lines.append(DIVIDER)
             lines.append("")
 
     # ── 文件 ──
     if files:
-        lines.append("📁 新文件")
-        lines.append("")
-        for f in files:
-            name = f.get("display_name") or f.get("filename", "未命名")
-            cid = f.get("course_id")
+        for fi in files:
+            cid = fi.get("course_id")
             course_name = course_map.get(cid, f"课程{cid}")
-            size = f.get("size", 0)
-            file_url = f.get("url", "")
-
-            size_str = format_size(size) if size else "未知"
-            over_limit = size and size > SIZE_LIMIT_BYTES
-
-            lines.append(f"【文件】{name}")
-            lines.append(f"课程：{course_name}")
-            lines.append(f"大小：{size_str}" + (" ⚠️ 超过 20MB，不自动下载" if over_limit else ""))
-            if file_url:
-                lines.append(f"链接：{file_url}")
+            lines.append(format_file_item(fi, course_name))
+            lines.append("")
+            lines.append(DIVIDER)
             lines.append("")
 
     if not (assignments or files or announcements):
         return ""  # 无增量
 
-    lines.append("─" * 20)
     lines.append(f"说明：超过 {SIZE_LIMIT_MB}MB 的文件不会自动下载，请手动访问链接。")
     return "\n".join(lines)
 
