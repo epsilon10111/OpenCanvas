@@ -14,16 +14,20 @@ Canvas 轮询检查脚本
     - 仅增量通知 - 无新内容时不发送消息
     - 20MB 限制 - 超过 20MB 的文件只记录链接，不下载
     - 微信通知 - 直接发送消息到当前聊天
+    - 完整内容 - 公告不截断，显示作者，提取图片
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 
@@ -33,6 +37,118 @@ STATE_FILE = Path(__file__).parent.parent / "state" / "poll_state.json"
 NOTIFICATION_FILE = Path(__file__).parent.parent / "state" / "poll_notification.md"
 SIZE_LIMIT_MB = 20
 SIZE_LIMIT_BYTES = SIZE_LIMIT_MB * 1024 * 1024
+
+
+class HTMLToTextParser(HTMLParser):
+    """将 HTML 转换为可读文本，同时提取图片 URL"""
+
+    def __init__(self, base_url: str = ""):
+        super().__init__()
+        self.base_url = base_url
+        self.text_parts: list[str] = []
+        self.images: list[str] = []
+        self._in_skip = False
+        self._skip_tags = {"script", "style"}
+        self._skip_count = 0
+        self._block_tags = {
+            "div", "p", "h1", "h2", "h3", "h4", "h5", "h6",
+            "ul", "ol", "li", "table", "tr", "blockquote",
+            "pre", "hr", "br", "section", "article", "header", "footer",
+        }
+        self._list_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in self._skip_tags:
+            self._skip_count += 1
+            self._in_skip = True
+            return
+        if self._in_skip:
+            return
+
+        attrs_dict = dict(attrs)
+
+        if tag == "img":
+            src = attrs_dict.get("src", "")
+            if src:
+                img_url = urljoin(self.base_url, src)
+                self.images.append(img_url)
+                return
+
+        if tag == "br":
+            self.text_parts.append("\n")
+        elif tag in self._block_tags:
+            self.text_parts.append("\n")
+        elif tag == "li":
+            self._list_depth += 1
+            self.text_parts.append("\n  " + "  " * (self._list_depth - 1) + "• ")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self._skip_tags:
+            self._skip_count -= 1
+            if self._skip_count <= 0:
+                self._in_skip = False
+                self._skip_count = 0
+            return
+        if self._in_skip:
+            return
+
+        if tag in self._block_tags:
+            self.text_parts.append("\n")
+        if tag == "li":
+            self._list_depth = max(0, self._list_depth - 1)
+
+    def handle_data(self, data):
+        if self._in_skip:
+            return
+        self.text_parts.append(data)
+
+    def get_text(self) -> str:
+        raw = "".join(self.text_parts)
+        # 压缩多余空白行
+        lines = raw.split("\n")
+        cleaned = []
+        blank_count = 0
+        for line in lines:
+            if line.strip():
+                blank_count = 0
+                cleaned.append(line)
+            else:
+                blank_count += 1
+                if blank_count <= 2:
+                    cleaned.append("")
+        return "\n".join(cleaned).strip()
+
+
+def html_to_readable(html_content: str, base_url: str = "") -> tuple[str, list[str]]:
+    """
+    将 HTML 内容转换为可读文本，返回 (文本, 图片URL列表)
+    """
+    if not html_content:
+        return "", []
+
+    # 简单清理常见 HTML 包装
+    parser = HTMLToTextParser(base_url)
+    try:
+        parser.feed(html_content)
+    except Exception:
+        # 解析失败时回退到纯文本
+        return strip_html_tags(html_content), []
+
+    return parser.get_text(), parser.images
+
+
+def strip_html_tags(html: str) -> str:
+    """简单移除 HTML 标签"""
+    text = re.sub(r"<[^>]+>", "", html)
+    text = text.replace("&nbsp;", " ")
+    text = text.replace("&amp;", "&")
+    text = text.replace("&lt;", "<")
+    text = text.replace("&gt;", ">")
+    text = text.replace("&quot;", '"')
+    text = text.replace("&#39;", "'")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def load_state() -> dict[str, Any]:
@@ -138,72 +254,116 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def format_announcement(ann: dict[str, Any], course_name: str, base_url: str) -> str:
+    """格式化单个公告为可读文本"""
+    title = ann.get("title", "未命名")
+    author = ann.get("user_name") or ann.get("author_name") or "未知"
+    posted_at = ann.get("posted_at") or ann.get("created_at")
+    message_html = ann.get("message", "")
+
+    # 转换 HTML 为可读文本，提取图片
+    message_text, images = html_to_readable(message_html, base_url)
+
+    lines = []
+    lines.append(f"【公告】{title}")
+    lines.append(f"课程：{course_name}")
+    lines.append(f"发布者：{author}")
+    if posted_at:
+        try:
+            # 解析 ISO 时间
+            dt = datetime.fromisoformat(posted_at.replace("Z", "+00:00"))
+            lines.append(f"时间：{dt.strftime('%Y-%m-%d %H:%M')}")
+        except Exception:
+            lines.append(f"时间：{posted_at[:16].replace('T', ' ')}")
+
+    if message_text:
+        lines.append("")
+        lines.append(message_text)
+
+    # 添加图片
+    if images:
+        lines.append("")
+        for img_url in images:
+            lines.append(f"[图片] {img_url}")
+
+    return "\n".join(lines)
+
+
 def format_markdown_digest(
     assignments: list[dict[str, Any]],
     files: list[dict[str, Any]],
     announcements: list[dict[str, Any]],
     course_map: dict[int, str],
+    base_url: str = "",
 ) -> str:
-    """格式化 Markdown 通知"""
-    lines = ["# 📦 Canvas 更新提醒\n"]
-    lines.append(f"_检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}__\n")
+    """格式化微信友好的通知内容"""
+    lines = []
+    lines.append("📦 Canvas 更新提醒")
+    lines.append(f"检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
 
+    # ── 公告 ──
+    if announcements:
+        for ann in announcements:
+            cid = ann.get("course_id", ann.get("context_course_id"))
+            course_name = course_map.get(cid, f"课程{cid}")
+            lines.append(format_announcement(ann, course_name, base_url))
+            lines.append("")
+            lines.append("─" * 20)
+            lines.append("")
+
+    # ── 作业 ──
     if assignments:
-        lines.append("## 📝 新作业\n")
+        lines.append("📝 新作业")
+        lines.append("")
         for a in assignments:
             title = a.get("name", "未命名")
             cid = a.get("course_id")
             course_name = course_map.get(cid, f"课程{cid}")
             due = a.get("due_at")
             points = a.get("points_possible")
-            
-            lines.append(f"### {title}")
-            lines.append(f"- 课程：{course_name}")
+            description = a.get("description", "")
+
+            lines.append(f"【作业】{title}")
+            lines.append(f"课程：{course_name}")
             if due:
                 due_str = due[:16].replace("T", " ")
-                lines.append(f"- 截止：{due_str}")
+                lines.append(f"截止：{due_str}")
             if points is not None:
-                lines.append(f"- 分数：{points}")
+                lines.append(f"分数：{points}")
+            if description:
+                desc_text = html_to_readable(description, base_url)[0]
+                if desc_text:
+                    lines.append("")
+                    lines.append(desc_text)
             lines.append("")
 
+    # ── 文件 ──
     if files:
-        lines.append("## 📁 新文件\n")
+        lines.append("📁 新文件")
+        lines.append("")
         for f in files:
             name = f.get("display_name") or f.get("filename", "未命名")
             cid = f.get("course_id")
             course_name = course_map.get(cid, f"课程{cid}")
             size = f.get("size", 0)
             file_url = f.get("url", "")
-            
+
             size_str = format_size(size) if size else "未知"
             over_limit = size and size > SIZE_LIMIT_BYTES
-            
-            lines.append(f"### {name}")
-            lines.append(f"- 课程：{course_name}")
-            lines.append(f"- 大小：{size_str}" + (" ⚠️ **超过 20MB，不自动下载**" if over_limit else ""))
-            if file_url:
-                lines.append(f"- 链接：{file_url}")
-            lines.append("")
 
-    if announcements:
-        lines.append("## 📢 新公告\n")
-        for ann in announcements:
-            title = ann.get("title", "未命名")
-            cid = ann.get("course_id", ann.get("context_course_id"))
-            course_name = course_map.get(cid, f"课程{cid}")
-            message = ann.get("message", "")[:200]  # 截取前 200 字
-            
-            lines.append(f"### {title}")
-            lines.append(f"- 课程：{course_name}")
-            if message:
-                lines.append(f"- 摘要：{message}...")
+            lines.append(f"【文件】{name}")
+            lines.append(f"课程：{course_name}")
+            lines.append(f"大小：{size_str}" + (" ⚠️ 超过 20MB，不自动下载" if over_limit else ""))
+            if file_url:
+                lines.append(f"链接：{file_url}")
             lines.append("")
 
     if not (assignments or files or announcements):
         return ""  # 无增量
 
-    lines.append("---")
-    lines.append(f"**说明**: 超过 {SIZE_LIMIT_MB}MB 的文件不会自动下载，请手动访问链接。")
+    lines.append("─" * 20)
+    lines.append(f"说明：超过 {SIZE_LIMIT_MB}MB 的文件不会自动下载，请手动访问链接。")
     return "\n".join(lines)
 
 
@@ -211,7 +371,6 @@ def send_wechat_message(markdown_content: str, target: str, account_id: str) -> 
     """通过 OpenClaw 发送微信消息"""
     import subprocess
     try:
-        # 使用 openclaw message 命令发送
         cmd = [
             "openclaw", "message", "send",
             "--channel", "openclaw-weixin",
@@ -320,7 +479,9 @@ def main() -> None:
             return
 
         # 格式化消息
-        markdown = format_markdown_digest(new_assignments, new_files, new_announcements, course_map)
+        markdown = format_markdown_digest(
+            new_assignments, new_files, new_announcements, course_map, base_url
+        )
         if not markdown:
             print("[轮询] 无内容可发送")
             return
